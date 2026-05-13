@@ -94,12 +94,27 @@
     .checkbox-group input[type="checkbox"]{min-height:auto;height:20px;width:20px}
     .checkbox-group label{font-weight:normal;margin-bottom:0}
 
+    /* --- Save controls (screen) --- */
+    .save-panel{
+      display:flex;align-items:center;justify-content:space-between;gap:1rem;
+      background-color:var(--surface-color);border:1px solid var(--border-color);
+      border-radius:8px;padding:1rem;margin-bottom:1.5rem;box-shadow:var(--shadow)
+    }
+    .save-panel strong{display:block;font-size:1rem}
+    .save-panel span{display:block;color:var(--secondary-color);font-size:.9rem;margin-top:.15rem}
+    .save-actions{display:flex;gap:.75rem;flex-shrink:0}
+
     /* --- Footer (screen) --- */
     footer{
       display:flex;gap:1rem;justify-content:center;padding:1.5rem;
       background-color:var(--surface-color);border-radius:8px;box-shadow:var(--shadow)
     }
     footer button{width:100%}
+    @media (max-width:599px){
+      .save-panel{align-items:stretch;flex-direction:column}
+      .save-actions{flex-direction:column}
+      .save-actions button{width:100%}
+    }
     @media (min-width:600px){ footer{flex-direction:row} footer button{width:auto} }
 
     /* ===== A4紙フォーマット（print） ===== */
@@ -234,6 +249,17 @@
         </section>
       </form>
     </main>
+
+    <div class="save-panel">
+      <div>
+        <strong>入力内容は入力と同時にこの端末へ自動保存されます</strong>
+        <span id="save-status" aria-live="polite">保存準備中</span>
+      </div>
+      <div class="save-actions">
+        <button type="button" id="save-data-btn" class="btn-secondary">今すぐ保存</button>
+        <button type="button" id="reset-day-btn" class="btn-danger">この日の入力をリセット</button>
+      </div>
+    </div>
 
     <footer>
       <button type="button" id="print-btn" class="btn">PDF保存 / 印刷</button>
@@ -386,11 +412,16 @@
       // --- Constants ---
       const DELIVERY_LOCATIONS = ['エバーメイト','ハマ','ヤマノセンター','協和ゴム','三宝','山野美容','資生堂','寿硝子','渋谷美容','深井硝子','大成化学','東京硝子','藤本科学','日本美容','牧口ゴム','明方堂','その他'];
       const INTERNAL_WORK_ITEMS = ['工場成形品回収','工場形品片付け','指定納期品片付け','在庫品片付け','次回配送準備','荷受け','ノズルチップ付け','トリガー検査','瓶体検査','内職準備','内職配送','内職回収品片付け','その他'];
+      const STORAGE_PREFIX = 'delivery-report:v2:';
 
       // --- Element Refs ---
+      const reportForm = document.getElementById('reportForm');
       const reportDate = document.getElementById('report-date');
       const userName   = document.getElementById('user-name');
       const printBtn   = document.getElementById('print-btn');
+      const saveDataBtn = document.getElementById('save-data-btn');
+      const resetDayBtn = document.getElementById('reset-day-btn');
+      const saveStatus = document.getElementById('save-status');
 
       const deliveryList = document.getElementById('delivery-list');
       const addDeliveryBtn = document.getElementById('add-delivery-btn');
@@ -403,34 +434,79 @@
       const nextDayRouteList = document.getElementById('next-day-route-list');
       const addNextRouteBtn = document.getElementById('add-next-route-btn');
       const nextRouteTemplate = document.getElementById('next-route-item-template');
+      const departureTime = document.getElementById('departure-time');
+      const returnTime = document.getElementById('return-time');
+      const mileage = document.getElementById('mileage');
+      const specialNotes = document.getElementById('special-notes');
+
+      let currentStorageDate = '';
+      let isRestoring = false;
+      let suppressSaveUntilEdit = false;
+      let uidCounter = 0;
 
       // --- Helpers ---
       const formatTime = (d)=>`${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+      const formatDateInput = (d)=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
       const populateSelect = (el, opts)=>{ el.innerHTML=''; opts.forEach(t=>{ const o=document.createElement('option'); o.value=t; o.textContent=t; el.appendChild(o); }); };
+      const storageKey = (date)=>`${STORAGE_PREFIX}${date}`;
+      const setSaveStatus = (text)=>{ saveStatus.textContent = text; };
+      const setSelectValue = (select, value, otherInput, otherValue = '') => {
+        if(!select) return;
+        if(DELIVERY_LOCATIONS.includes(value)){ select.value = value; }
+        else if(value){ select.value = 'その他'; otherValue = otherValue || value; }
+        if(otherInput){
+          otherInput.value = otherValue || '';
+          otherInput.style.display = select.value === 'その他' ? 'block' : 'none';
+        }
+      };
+      const safeGet = (key) => {
+        try{ return localStorage.getItem(key); }
+        catch(_){ setSaveStatus('この端末では自動保存を使えません'); return null; }
+      };
+      const safeSet = (key, value) => {
+        try{ localStorage.setItem(key, value); return true; }
+        catch(_){ setSaveStatus('保存できませんでした。端末の空き容量やブラウザ設定を確認してください'); return false; }
+      };
+      const safeRemove = (key) => {
+        try{ localStorage.removeItem(key); return true; }
+        catch(_){ setSaveStatus('保存データを削除できませんでした'); return false; }
+      };
 
       // --- Dynamic creators ---
-      const createDeliveryItem = () => {
+      const createDeliveryItem = (data = {}) => {
         const content = deliveryTemplate.content.cloneNode(true);
         const select = content.querySelector('.delivery-location');
+        const other = content.querySelector('.delivery-location-other');
         populateSelect(select, DELIVERY_LOCATIONS);
+        content.querySelector('.delivery-start-time').value = data.start || '';
+        content.querySelector('.delivery-end-time').value = data.end || '';
+        setSelectValue(select, data.location || DELIVERY_LOCATIONS[0], other, data.other || '');
         deliveryList.appendChild(content);
       };
-      const createInternalWorkItem = () => {
+      const createInternalWorkItem = (data = {}) => {
         const content = internalWorkTemplate.content.cloneNode(true);
         const box = content.querySelector('.work-description-options');
-        const uid = Date.now();
+        const uid = `${Date.now()}-${++uidCounter}`;
         INTERNAL_WORK_ITEMS.forEach((txt,i)=>{
           const g=document.createElement('div'); g.className='checkbox-group';
           const cb=document.createElement('input'); cb.type='checkbox'; cb.id=`work-${uid}-${i}`; cb.value=txt; cb.className='work-description-checkbox';
           const lb=document.createElement('label'); lb.htmlFor=cb.id; lb.textContent=txt;
+          if(Array.isArray(data.items) && data.items.includes(txt)){ cb.checked = true; }
           g.appendChild(cb); g.appendChild(lb); box.appendChild(g);
         });
+        content.querySelector('.work-start-time').value = data.start || '';
+        content.querySelector('.work-end-time').value = data.end || '';
+        const other = content.querySelector('.work-description-other');
+        other.value = data.other || '';
+        other.style.display = Array.isArray(data.items) && data.items.includes('その他') ? 'block' : 'none';
         internalWorkList.appendChild(content);
       };
-      const createNextRouteItem = () => {
+      const createNextRouteItem = (data = {}) => {
         const content = nextRouteTemplate.content.cloneNode(true);
         const select = content.querySelector('.delivery-location');
+        const other = content.querySelector('.next-route-other');
         populateSelect(select, DELIVERY_LOCATIONS);
+        setSelectValue(select, data.location || DELIVERY_LOCATIONS[0], other, data.other || '');
         updateRouteNumbers();
         nextDayRouteList.appendChild(content);
         updateRouteNumbers();
@@ -439,6 +515,116 @@
         nextDayRouteList.querySelectorAll('.dynamic-item').forEach((item, idx)=>{
           item.querySelector('span').textContent = `${idx+1}.`;
         });
+      };
+      const resetFormForDate = (date) => {
+        reportDate.value = date || formatDateInput(new Date());
+        userName.value = '';
+        departureTime.value = '';
+        returnTime.value = '';
+        mileage.value = '';
+        specialNotes.value = '';
+        deliveryList.innerHTML = '';
+        internalWorkList.innerHTML = '';
+        nextDayRouteList.innerHTML = '';
+        createDeliveryItem();
+        createInternalWorkItem();
+        createNextRouteItem();
+      };
+      const collectReportData = (dateOverride) => ({
+        version: 2,
+        savedAt: new Date().toISOString(),
+        date: dateOverride || reportDate.value || formatDateInput(new Date()),
+        userName: userName.value || '',
+        departureTime: departureTime.value || '',
+        returnTime: returnTime.value || '',
+        mileage: mileage.value || '',
+        specialNotes: specialNotes.value || '',
+        deliveries: Array.from(deliveryList.querySelectorAll('.dynamic-item')).map(item => ({
+          start: item.querySelector('.delivery-start-time')?.value || '',
+          end: item.querySelector('.delivery-end-time')?.value || '',
+          location: item.querySelector('.delivery-location')?.value || '',
+          other: item.querySelector('.delivery-location-other')?.value.trim() || ''
+        })),
+        internalWorks: Array.from(internalWorkList.querySelectorAll('.dynamic-item')).map(item => ({
+          start: item.querySelector('.work-start-time')?.value || '',
+          end: item.querySelector('.work-end-time')?.value || '',
+          items: Array.from(item.querySelectorAll('.work-description-checkbox:checked')).map(cb => cb.value),
+          other: item.querySelector('.work-description-other')?.value.trim() || ''
+        })),
+        nextRoutes: Array.from(nextDayRouteList.querySelectorAll('.dynamic-item')).map(item => ({
+          location: item.querySelector('.delivery-location')?.value || '',
+          other: item.querySelector('.next-route-other')?.value.trim() || ''
+        }))
+      });
+      const saveReport = (dateOverride, options = {}) => {
+        const date = dateOverride || reportDate.value || currentStorageDate;
+        if(!date) return false;
+        if(suppressSaveUntilEdit && !options.force && date === currentStorageDate) return false;
+        const data = collectReportData(date);
+        const saved = safeSet(storageKey(date), JSON.stringify(data));
+        if(saved && !options.silent){
+          const now = new Date();
+          setSaveStatus(`${date} の入力を保存しました（${formatTime(now)}）`);
+        }
+        return saved;
+      };
+      const scheduleSave = () => {
+        if(isRestoring) return;
+        suppressSaveUntilEdit = false;
+        saveReport();
+      };
+      const loadReport = (date) => {
+        isRestoring = true;
+        let data = null;
+        const raw = safeGet(storageKey(date));
+        if(raw){
+          try{ data = JSON.parse(raw); }
+          catch(_){ data = null; }
+        }
+
+        if(!data){
+          resetFormForDate(date);
+          currentStorageDate = date;
+          setSaveStatus(`${date} は新しい日報です`);
+          isRestoring = false;
+          return;
+        }
+
+        reportDate.value = data.date || date;
+        userName.value = data.userName || '';
+        departureTime.value = data.departureTime || '';
+        returnTime.value = data.returnTime || '';
+        mileage.value = data.mileage || '';
+        specialNotes.value = data.specialNotes || '';
+
+        deliveryList.innerHTML = '';
+        internalWorkList.innerHTML = '';
+        nextDayRouteList.innerHTML = '';
+        (data.deliveries?.length ? data.deliveries : [{}]).forEach(createDeliveryItem);
+        (data.internalWorks?.length ? data.internalWorks : [{}]).forEach(createInternalWorkItem);
+        (data.nextRoutes?.length ? data.nextRoutes : [{}]).forEach(createNextRouteItem);
+
+        currentStorageDate = data.date || date;
+        setSaveStatus(`${currentStorageDate} の保存データを読み込みました`);
+        isRestoring = false;
+      };
+      const changeReportDate = () => {
+        if(isRestoring) return;
+        const nextDate = reportDate.value || formatDateInput(new Date());
+        if(currentStorageDate && currentStorageDate !== nextDate){ saveReport(currentStorageDate, { silent:true }); }
+        loadReport(nextDate);
+      };
+      const resetCurrentDay = () => {
+        const date = reportDate.value || currentStorageDate || formatDateInput(new Date());
+        const message = `PDF保存 / 印刷が終わっていることを確認してください。\n${date} の入力内容をリセットしますか？`;
+        if(!window.confirm(message)) return;
+        isRestoring = true;
+        safeRemove(storageKey(date));
+        resetFormForDate(date);
+        currentStorageDate = date;
+        suppressSaveUntilEdit = true;
+        setSaveStatus(`${date} の入力をリセットしました`);
+        isRestoring = false;
       };
 
       // --- Event handlers ---
@@ -450,11 +636,12 @@
             const next=e.target.nextElementSibling;
             if(next && next.type==='time'){ next.value=formatTime(new Date()); }
           }
+          scheduleSave();
         }
         if(e.target.closest('.remove-btn')){
           const item=e.target.closest('.dynamic-item');
           const isRoute=item.parentElement.id==='next-day-route-list';
-          if(item){ item.remove(); if(isRoute) updateRouteNumbers(); }
+          if(item){ item.remove(); if(isRoute) updateRouteNumbers(); scheduleSave(); }
         }
       });
 
@@ -479,9 +666,20 @@
         }
       });
 
-      addDeliveryBtn.addEventListener('click', createDeliveryItem);
-      addInternalWorkBtn.addEventListener('click', createInternalWorkItem);
-      addNextRouteBtn.addEventListener('click', createNextRouteItem);
+      addDeliveryBtn.addEventListener('click', () => { createDeliveryItem(); scheduleSave(); });
+      addInternalWorkBtn.addEventListener('click', () => { createInternalWorkItem(); scheduleSave(); });
+      addNextRouteBtn.addEventListener('click', () => { createNextRouteItem(); scheduleSave(); });
+      reportForm.addEventListener('input', (e) => {
+        if(e.target === reportDate) return;
+        scheduleSave();
+      });
+      reportForm.addEventListener('change', (e) => {
+        if(e.target === reportDate){ changeReportDate(); return; }
+        scheduleSave();
+      });
+      saveDataBtn.addEventListener('click', () => { suppressSaveUntilEdit = false; saveReport(undefined, { force:true }); });
+      resetDayBtn.addEventListener('click', resetCurrentDay);
+      window.addEventListener('beforeunload', () => saveReport(currentStorageDate || reportDate.value, { silent:true }));
 
       // ---- 印刷用：紙レイアウトへデータ流し込み ----
       const buildPrintSheet = () => {
@@ -548,15 +746,16 @@
 
       // 印刷ボタン
       printBtn.addEventListener('click', () => {
+        suppressSaveUntilEdit = false;
+        saveReport(undefined, { force:true });
         buildPrintSheet();
         window.print();
+        setSaveStatus('印刷用データを作成しました。保存後は必要に応じてリセットできます');
       });
 
       // --- Initial State ---
-      reportDate.valueAsDate = new Date();
-      createDeliveryItem();
-      createInternalWorkItem();
-      createNextRouteItem();
+      currentStorageDate = formatDateInput(new Date());
+      loadReport(currentStorageDate);
     });
   </script>
 </body>
